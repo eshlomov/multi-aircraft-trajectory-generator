@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -13,6 +14,18 @@ G = 9.80665
 EARTH_RADIUS_M = 6_378_137.0
 EXCEL_MAX_ROWS = 1_048_576
 MAX_DATA_ROWS_PER_SHEET = EXCEL_MAX_ROWS - 1
+
+# Approximate geographic bounding boxes (south, north, west, east), in degrees.
+# Initial aircraft positions are sampled uniformly inside the selected rectangle.
+REGIONS = {
+    "Switzerland": {"bounds": (45.80, 47.82, 5.95, 10.50), "center": (46.82, 8.23), "zoom": 6.4},
+    "Israel": {"bounds": (29.45, 33.35, 34.25, 35.90), "center": (31.40, 35.00), "zoom": 7.0},
+    "Austria": {"bounds": (46.35, 49.05, 9.50, 17.20), "center": (47.60, 13.70), "zoom": 6.0},
+    "Germany": {"bounds": (47.25, 55.10, 5.85, 15.10), "center": (51.10, 10.40), "zoom": 5.5},
+    "France": {"bounds": (41.30, 51.20, -5.30, 9.80), "center": (46.60, 2.50), "zoom": 5.2},
+    "United Kingdom": {"bounds": (49.80, 58.70, -8.20, 1.90), "center": (54.50, -3.00), "zoom": 5.2},
+    "United States (continental)": {"bounds": (25.00, 49.50, -124.80, -66.90), "center": (39.50, -98.35), "zoom": 2.8},
+}
 
 PRESETS = pd.DataFrame([
     {
@@ -67,7 +80,7 @@ def generate_aircraft_trajectory(
     aircraft_type: str,
     duration_s: float,
     sample_rate_hz: float,
-    start_time_utc: datetime,
+    start_epoch_s: float,
     start_lat_deg: float,
     start_lon_deg: float,
     altitude_m: float,
@@ -143,14 +156,12 @@ def generate_aircraft_trajectory(
     horizontal_speed = np.maximum(speed * np.cos(pitch_rad), 0.1)
     roll = np.rad2deg(np.arctan(horizontal_speed * yaw_rate_rps / G))
 
-    timestamps = [
-        (start_time_utc + pd.to_timedelta(float(sec), unit="s")).isoformat()
-        for sec in t
-    ]
+    # Unix Epoch seconds (UTC). Keep fractional seconds for sub-second sampling rates.
+    epoch_tags = start_epoch_s + t
 
     return pd.DataFrame({
         "simulation_time_s": t,
-        "time_tag_utc": timestamps,
+        "time_tag_epoch_s": epoch_tags,
         "aircraft_id": aircraft_id,
         "aircraft_type": aircraft_type,
         "latitude_deg": latitude,
@@ -170,12 +181,12 @@ def generate_simultaneous_batch(
     aircraft_table: pd.DataFrame,
     duration_s: float,
     sample_rate_hz: float,
-    start_lat_deg: float,
-    start_lon_deg: float,
+    region_name: str,
     seed: int | None,
 ):
     rng = np.random.default_rng(seed)
-    shared_start_time = datetime.now(timezone.utc).replace(microsecond=0)
+    shared_start_epoch_s = datetime.now(timezone.utc).timestamp()
+    south, north, west, east = REGIONS[region_name]["bounds"]
     all_tracks = []
     summary_rows = []
     aircraft_number = 0
@@ -187,6 +198,9 @@ def generate_simultaneous_batch(
             aircraft_number += 1
             aircraft_id = f"AC-{aircraft_number:04d}"
             speed = float(rng.uniform(row["speed_min_mps"], row["speed_max_mps"]))
+            # Give every aircraft its own initial location within the selected region.
+            start_lat = float(rng.uniform(south, north))
+            start_lon = float(rng.uniform(west, east))
             heading = float(row["heading_deg"]) % 360.0
             pitch = float(row["pitch_deg"])
 
@@ -195,9 +209,9 @@ def generate_simultaneous_batch(
                 aircraft_type=aircraft_type,
                 duration_s=duration_s,
                 sample_rate_hz=sample_rate_hz,
-                start_time_utc=shared_start_time,
-                start_lat_deg=start_lat_deg,
-                start_lon_deg=start_lon_deg,
+                start_epoch_s=shared_start_epoch_s,
+                start_lat_deg=start_lat,
+                start_lon_deg=start_lon,
                 altitude_m=float(row["altitude_m"]),
                 speed_mps=speed,
                 heading_deg=heading,
@@ -211,8 +225,8 @@ def generate_simultaneous_batch(
             summary_rows.append({
                 "aircraft_id": aircraft_id,
                 "aircraft_type": aircraft_type,
-                "initial_latitude_deg": start_lat_deg,
-                "initial_longitude_deg": start_lon_deg,
+                "initial_latitude_deg": start_lat,
+                "initial_longitude_deg": start_lon,
                 "initial_altitude_m": float(row["altitude_m"]),
                 "initial_speed_mps": speed,
                 "initial_heading_deg": heading,
@@ -220,7 +234,7 @@ def generate_simultaneous_batch(
                 "profile": str(row["profile"]),
                 "samples": len(track),
                 "duration_s": duration_s,
-                "shared_start_time_utc": shared_start_time.isoformat(),
+                "shared_start_epoch_s": shared_start_epoch_s,
             })
 
     combined = pd.concat(all_tracks, ignore_index=True) if all_tracks else pd.DataFrame()
@@ -286,7 +300,7 @@ def make_excel(combined: pd.DataFrame, summary: pd.DataFrame, aircraft_table: pd
 
 st.set_page_config(page_title="Multi-Aircraft Trajectory Generator", page_icon="🛩️", layout="wide")
 st.title("Multi-Aircraft Synthetic Trajectory Generator")
-st.caption("Generate synchronized trajectories for multiple UAV types and export the combined dataset.")
+st.caption("Generate synchronized trajectories for multiple UAV types, choose a geographical region, visualize all paths and export the combined dataset.")
 
 st.subheader("1. Shared simulation settings")
 c1, c2, c3 = st.columns(3)
@@ -299,11 +313,18 @@ with c3:
 
 c4, c5, c6 = st.columns(3)
 with c4:
-    start_lat = st.number_input("Common origin latitude (deg)", -89.9, 89.9, 32.0853, format="%.6f")
+    region_name = st.selectbox("Geographical region", list(REGIONS.keys()), index=0)
 with c5:
-    start_lon = st.number_input("Common origin longitude (deg)", -180.0, 180.0, 34.7818, format="%.6f")
-with c6:
     st.metric("Samples per aircraft", f"{int(math.floor(duration * sample_rate)) + 1:,}")
+with c6:
+    st.metric("Time tag format", "Unix Epoch (seconds)")
+region_info = REGIONS[region_name]
+st.caption(
+    f"Initial aircraft positions are randomized inside the approximate {region_name} region "
+    f"(latitude {region_info['bounds'][0]:.2f}–{region_info['bounds'][1]:.2f}°, "
+    f"longitude {region_info['bounds'][2]:.2f}–{region_info['bounds'][3]:.2f}°). "
+    "This is a rectangular bounding area, not an exact national-border polygon."
+)
 
 st.subheader("2. Aircraft type configuration")
 st.write(
@@ -371,8 +392,8 @@ if generate:
         "samples_per_aircraft": samples_per_aircraft,
         "total_aircraft": total_aircraft,
         "total_samples": total_rows,
-        "common_origin_latitude_deg": start_lat,
-        "common_origin_longitude_deg": start_lon,
+        "geographical_region": region_name,
+        "region_bounds_lat_lon": str(REGIONS[region_name]["bounds"]),
         "random_seed": seed,
         "time_base": "Shared UTC start time and synchronized elapsed time",
         "coordinate_frame": "Local NED; heading clockwise from north; pitch positive nose-up",
@@ -381,7 +402,7 @@ if generate:
 
     with st.spinner("Generating all aircraft on a shared simulation clock..."):
         combined, summary = generate_simultaneous_batch(
-            aircraft_table, duration, sample_rate, start_lat, start_lon, seed
+            aircraft_table, duration, sample_rate, region_name, seed
         )
         xlsx = make_excel(combined, summary, aircraft_table, settings)
 
@@ -393,6 +414,47 @@ if generate:
     a.metric("Aircraft", f"{total_aircraft:,}")
     b.metric("Aircraft types", f"{aircraft_table['aircraft_type'].nunique():,}")
     c.metric("Total data rows", f"{len(combined):,}")
+    st.subheader("All aircraft trajectories")
+    st.caption("Interactive geographic map. Each colored line represents one aircraft trajectory.")
+    fig = go.Figure()
+    # Downsample only the visualization; the Excel export retains every generated sample.
+    max_points_per_track = 300
+    for aircraft_id, track in combined.groupby("aircraft_id", sort=True):
+        step = max(1, int(math.ceil(len(track) / max_points_per_track)))
+        display_track = track.iloc[::step]
+        if display_track.index[-1] != track.index[-1]:
+            display_track = pd.concat([display_track, track.tail(1)])
+        fig.add_trace(go.Scattermapbox(
+            lat=display_track["latitude_deg"],
+            lon=display_track["longitude_deg"],
+            mode="lines",
+            name=f"{aircraft_id} ({track['aircraft_type'].iloc[0]})",
+            line={"width": 2},
+            hovertemplate=(
+                f"{aircraft_id}<br>Lat: %{{lat:.5f}}<br>Lon: %{{lon:.5f}}<extra></extra>"
+            ),
+        ))
+        # Mark the initial position of each aircraft.
+        fig.add_trace(go.Scattermapbox(
+            lat=[track["latitude_deg"].iloc[0]],
+            lon=[track["longitude_deg"].iloc[0]],
+            mode="markers",
+            name=f"{aircraft_id} start",
+            marker={"size": 7},
+            showlegend=False,
+            hovertemplate=f"{aircraft_id} start<extra></extra>",
+        ))
+    fig.update_layout(
+        mapbox={
+            "style": "open-street-map",
+            "center": {"lat": region_info["center"][0], "lon": region_info["center"][1]},
+            "zoom": region_info["zoom"],
+        },
+        margin={"l": 0, "r": 0, "t": 10, "b": 0},
+        height=650,
+        legend={"orientation": "h", "yanchor": "bottom", "y": -0.12},
+    )
+    st.plotly_chart(fig, use_container_width=True)
     st.subheader("Combined dataset preview")
     st.dataframe(combined.head(30), use_container_width=True)
     st.download_button(
