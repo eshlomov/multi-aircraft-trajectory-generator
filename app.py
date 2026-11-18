@@ -298,8 +298,8 @@ def make_excel(combined: pd.DataFrame, summary: pd.DataFrame, aircraft_table: pd
     return buf.getvalue()
 
 
-st.set_page_config(page_title="Multi-Aircraft Trajectory Generator", page_icon="🛩️", layout="wide")
-st.title("Multi-Aircraft Synthetic Trajectory Generator")
+st.set_page_config(page_title="AeroGen", page_icon="🛩️", layout="wide")
+st.title("AeroGen- Synthetic Air Traffic Generator")
 st.caption("Generate synchronized trajectories for multiple UAV types, choose a geographical region, visualize all paths and export the combined dataset.")
 
 st.subheader("1. Shared simulation settings")
@@ -414,38 +414,55 @@ if generate:
     a.metric("Aircraft", f"{total_aircraft:,}")
     b.metric("Aircraft types", f"{aircraft_table['aircraft_type'].nunique():,}")
     c.metric("Total data rows", f"{len(combined):,}")
-    st.subheader("All aircraft trajectories")
-    st.caption("Interactive geographic map. Each colored line represents one aircraft trajectory.")
+    st.subheader("Airsky Picture")
+    st.caption("Interactive geographic map. Each colored line represents one aircraft type.")
     fig = go.Figure()
+    class_palette = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    ]
+    aircraft_types = combined["aircraft_type"].drop_duplicates().tolist()
+    class_colors = {
+        aircraft_type: class_palette[index % len(class_palette)]
+        for index, aircraft_type in enumerate(aircraft_types)
+    }
+    shown_classes = set()
     # Downsample only the visualization; the Excel export retains every generated sample.
     max_points_per_track = 300
     for aircraft_id, track in combined.groupby("aircraft_id", sort=True):
+        aircraft_type = track["aircraft_type"].iloc[0]
+        color = class_colors[aircraft_type]
         step = max(1, int(math.ceil(len(track) / max_points_per_track)))
         display_track = track.iloc[::step]
         if display_track.index[-1] != track.index[-1]:
             display_track = pd.concat([display_track, track.tail(1)])
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lat=display_track["latitude_deg"],
             lon=display_track["longitude_deg"],
             mode="lines",
-            name=f"{aircraft_id} ({track['aircraft_type'].iloc[0]})",
-            line={"width": 2},
+            name=aircraft_type,
+            legendgroup=aircraft_type,
+            showlegend=aircraft_type not in shown_classes,
+            line={"width": 2, "color": color},
             hovertemplate=(
-                f"{aircraft_id}<br>Lat: %{{lat:.5f}}<br>Lon: %{{lon:.5f}}<extra></extra>"
+                f"{aircraft_id} ({aircraft_type})<br>Lat: %{{lat:.5f}}<br>"
+                "Lon: %{lon:.5f}<extra></extra>"
             ),
         ))
+        shown_classes.add(aircraft_type)
         # Mark the initial position of each aircraft.
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lat=[track["latitude_deg"].iloc[0]],
             lon=[track["longitude_deg"].iloc[0]],
             mode="markers",
-            name=f"{aircraft_id} start",
-            marker={"size": 7},
+            name=f"{aircraft_id} start ({aircraft_type})",
+            legendgroup=aircraft_type,
+            marker={"size": 7, "color": color},
             showlegend=False,
-            hovertemplate=f"{aircraft_id} start<extra></extra>",
+            hovertemplate=f"{aircraft_id} start ({aircraft_type})<extra></extra>",
         ))
     fig.update_layout(
-        mapbox={
+        map={
             "style": "open-street-map",
             "center": {"lat": region_info["center"][0], "lon": region_info["center"][1]},
             "zoom": region_info["zoom"],
