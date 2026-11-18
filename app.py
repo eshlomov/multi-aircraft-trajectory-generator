@@ -1,11 +1,13 @@
 import io
 import math
-from datetime import datetime, timezone
+import os
+from datetime import date, datetime, time, timezone
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -30,6 +32,7 @@ REGIONS = {
 PRESETS = pd.DataFrame([
     {
         "aircraft_type": "Multirotor-small",
+        "fr24_icao_types": "",
         "count": 3,
         "speed_min_mps": 5.0,
         "speed_max_mps": 12.0,
@@ -42,6 +45,7 @@ PRESETS = pd.DataFrame([
     },
     {
         "aircraft_type": "Multirotor-medium",
+        "fr24_icao_types": "",
         "count": 2,
         "speed_min_mps": 8.0,
         "speed_max_mps": 18.0,
@@ -54,6 +58,7 @@ PRESETS = pd.DataFrame([
     },
     {
         "aircraft_type": "Fixed-wing-small",
+        "fr24_icao_types": "",
         "count": 2,
         "speed_min_mps": 15.0,
         "speed_max_mps": 28.0,
@@ -242,6 +247,82 @@ def generate_simultaneous_batch(
     return combined, summary
 
 
+def get_fr24_token() -> str | None:
+    """Read an FR24 token from Streamlit secrets or the process environment."""
+    try:
+        token = st.secrets.get("FR24_API_TOKEN")
+    except Exception:
+        token = None
+    return token or os.getenv("FR24_API_TOKEN")
+
+
+def fetch_fr24_historical_positions(
+    start_epoch_s: int,
+    duration_s: int,
+    interval_s: int,
+    region_name: str,
+    class_type_codes: dict[str, set[str]],
+    api_token: str,
+) -> pd.DataFrame:
+    """Fetch sampled historical positions and retain configured ICAO type codes."""
+    south, north, west, east = REGIONS[region_name]["bounds"]
+    bounds = f"{north},{south},{west},{east}"
+    headers = {
+        "Accept": "application/json",
+        "Accept-Version": "v1",
+        "Authorization": f"Bearer {api_token}",
+    }
+    rows = []
+    request_epochs = range(start_epoch_s, start_epoch_s + duration_s + 1, interval_s)
+
+    for requested_epoch in request_epochs:
+        response = requests.get(
+            "https://fr24api.flightradar24.com/api/historic/flight-positions/full",
+            headers=headers,
+            params={"timestamp": requested_epoch, "bounds": bounds, "limit": 1000},
+            timeout=30,
+        )
+        if response.status_code == 401:
+            raise ValueError("FR24 rejected the API token. Check the token and subscription.")
+        if response.status_code == 403:
+            raise ValueError("FR24 denied this endpoint. Check that the token has API access.")
+        response.raise_for_status()
+        payload = response.json()
+        records = payload if isinstance(payload, list) else (payload.get("data") or [])
+        if not isinstance(records, list):
+            raise ValueError("FR24 returned an unexpected response format.")
+
+        for record in records:
+            type_code = str(record.get("type") or record.get("aircraft_type") or "").upper()
+            aircraft_class = next(
+                (name for name, codes in class_type_codes.items() if type_code in codes),
+                None,
+            )
+            if not aircraft_class:
+                continue
+            latitude = record.get("lat", record.get("latitude"))
+            longitude = record.get("lon", record.get("longitude"))
+            if latitude is None or longitude is None:
+                continue
+            observed_epoch = record.get("timestamp", requested_epoch)
+            try:
+                observed_epoch = int(observed_epoch)
+            except (TypeError, ValueError):
+                observed_epoch = requested_epoch
+            rows.append({
+                **record,
+                "simulation_time_s": observed_epoch - start_epoch_s,
+                "time_tag_epoch_s": observed_epoch,
+                "aircraft_id": str(record.get("fr24_id") or record.get("hex") or record.get("callsign") or "Unknown"),
+                "aircraft_type": aircraft_class,
+                "fr24_type_code": type_code,
+                "latitude_deg": float(latitude),
+                "longitude_deg": float(longitude),
+            })
+
+    return pd.DataFrame(rows)
+
+
 def make_excel(combined: pd.DataFrame, summary: pd.DataFrame, aircraft_table: pd.DataFrame,
                settings: dict) -> bytes:
     wb = Workbook()
@@ -338,6 +419,10 @@ aircraft_table = st.data_editor(
     key="aircraft_config_editor",
     column_config={
         "aircraft_type": st.column_config.TextColumn("Aircraft type"),
+        "fr24_icao_types": st.column_config.TextColumn(
+            "FR24 ICAO type codes (comma separated)",
+            help="Map this class to FR24 aircraft codes, such as C172 or B738.",
+        ),
         "count": st.column_config.NumberColumn("Number of aircraft", min_value=1, max_value=1000, step=1),
         "speed_min_mps": st.column_config.NumberColumn("Min speed (m/s)", min_value=0.1),
         "speed_max_mps": st.column_config.NumberColumn("Max speed (m/s)", min_value=0.1),
@@ -352,6 +437,26 @@ aircraft_table = st.data_editor(
 
 st.subheader("3. Output")
 st.caption("Excel output includes a synchronized master dataset and separate sheets by aircraft type.")
+extract_fr24 = st.checkbox("Extract real flight data from FR24?", value=False)
+if extract_fr24:
+    st.caption(
+        "Historical positions are queried within the selected region and time window. "
+        "Times below are UTC. Add FR24 ICAO type codes to each class above to match aircraft."
+    )
+    fr24_col1, fr24_col2, fr24_col3 = st.columns(3)
+    with fr24_col1:
+        fr24_date = st.date_input("FR24 date (UTC)", value=date.today())
+    with fr24_col2:
+        fr24_time = st.time_input("FR24 start time (UTC)", value=time(12, 0))
+    with fr24_col3:
+        fr24_interval_s = st.number_input(
+            "FR24 query interval (seconds)", min_value=10, max_value=3600,
+            value=60, step=10,
+        )
+    st.warning(
+        "FR24 historical extraction makes one API request per interval and may consume API credits. "
+        "The selected duration and region are used for the request window and geographic filter."
+    )
 generate = st.button("Generate synchronized multi-aircraft batch", type="primary", use_container_width=True)
 
 if generate:
@@ -386,6 +491,38 @@ if generate:
         st.stop()
 
     seed = int(seed_input) if seed_input.strip() else None
+    class_type_codes = {}
+    fr24_token = None
+    fr24_start_epoch = None
+    if extract_fr24:
+        for row in aircraft_table.to_dict("records"):
+            aircraft_class = str(row["aircraft_type"]).strip()
+            codes = {
+                code.strip().upper()
+                for code in str(row.get("fr24_icao_types", "")).split(",")
+                if code.strip()
+            }
+            if codes:
+                class_type_codes[aircraft_class] = codes
+        if not class_type_codes:
+            st.error("Enter at least one FR24 ICAO type code in the aircraft configuration table.")
+            st.stop()
+        request_count = math.floor(duration / fr24_interval_s) + 1
+        if request_count > 100:
+            st.error("This FR24 request would make over 100 API calls. Increase the query interval or shorten the duration.")
+            st.stop()
+        if fr24_date < date(2019, 11, 18) and fr24_interval_s < 60:
+            st.error("FR24 historical positions before 2019-11-18 have minute resolution. Set the query interval to at least 60 seconds.")
+            st.stop()
+        fr24_token = get_fr24_token()
+        if not fr24_token:
+            st.error(
+                "FR24 API token not found. Set FR24_API_TOKEN in Streamlit secrets or the environment."
+            )
+            st.stop()
+        fr24_start_epoch = int(
+            datetime.combine(fr24_date, fr24_time, tzinfo=timezone.utc).timestamp()
+        )
     settings = {
         "duration_s": duration,
         "sample_rate_hz": sample_rate,
@@ -400,11 +537,30 @@ if generate:
         "model_note": "Kinematic synthetic model; not validated aircraft performance or autopilot simulation",
     }
 
-    with st.spinner("Generating all aircraft on a shared simulation clock..."):
+    with st.spinner("Generating aircraft trajectories..."):
         combined, summary = generate_simultaneous_batch(
             aircraft_table, duration, sample_rate, region_name, seed
         )
         xlsx = make_excel(combined, summary, aircraft_table, settings)
+
+    fr24_tracks = pd.DataFrame()
+    if extract_fr24:
+        try:
+            with st.spinner("Requesting historical positions from FR24..."):
+                fr24_tracks = fetch_fr24_historical_positions(
+                    fr24_start_epoch,
+                    int(round(duration)),
+                    int(fr24_interval_s),
+                    region_name,
+                    class_type_codes,
+                    fr24_token,
+                )
+        except requests.RequestException as exc:
+            st.error(f"FR24 request failed: {exc}")
+            st.stop()
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
 
     st.success(
         f"Generated {total_aircraft:,} aircraft across {len(aircraft_table):,} aircraft types, "
@@ -415,13 +571,21 @@ if generate:
     b.metric("Aircraft types", f"{aircraft_table['aircraft_type'].nunique():,}")
     c.metric("Total data rows", f"{len(combined):,}")
     st.subheader("Airsky Picture")
-    st.caption("Interactive geographic map. Each colored line represents one aircraft type.")
+    map_tracks = fr24_tracks if extract_fr24 else combined
+    if extract_fr24:
+        st.caption("FR24 historical positions matched to your configured aircraft classes.")
+        if fr24_tracks.empty:
+            st.warning("FR24 returned no positions matching the selected time, region, and aircraft type codes.")
+        else:
+            st.success(f"Retrieved {len(fr24_tracks):,} FR24 positions for {fr24_tracks['aircraft_id'].nunique():,} flights.")
+    else:
+        st.caption("Interactive geographic map. Each colored line represents one aircraft type.")
     fig = go.Figure()
     class_palette = [
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
     ]
-    aircraft_types = combined["aircraft_type"].drop_duplicates().tolist()
+    aircraft_types = map_tracks["aircraft_type"].drop_duplicates().tolist() if not map_tracks.empty else []
     class_colors = {
         aircraft_type: class_palette[index % len(class_palette)]
         for index, aircraft_type in enumerate(aircraft_types)
@@ -429,7 +593,7 @@ if generate:
     shown_classes = set()
     # Downsample only the visualization; the Excel export retains every generated sample.
     max_points_per_track = 300
-    for aircraft_id, track in combined.groupby("aircraft_id", sort=True):
+    for aircraft_id, track in map_tracks.groupby("aircraft_id", sort=True):
         aircraft_type = track["aircraft_type"].iloc[0]
         color = class_colors[aircraft_type]
         step = max(1, int(math.ceil(len(track) / max_points_per_track)))
@@ -472,6 +636,14 @@ if generate:
         legend={"orientation": "h", "yanchor": "bottom", "y": -0.12},
     )
     st.plotly_chart(fig, use_container_width=True)
+    if extract_fr24 and not fr24_tracks.empty:
+        st.download_button(
+            "Download FR24 positions as CSV",
+            data=fr24_tracks.to_csv(index=False).encode("utf-8"),
+            file_name="fr24_historical_positions.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     st.subheader("Combined dataset preview")
     st.dataframe(combined.head(30), use_container_width=True)
     st.download_button(
