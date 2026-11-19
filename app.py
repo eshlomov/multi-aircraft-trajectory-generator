@@ -1,7 +1,8 @@
 import io
 import math
 import os
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timedelta, timezone
+from time import monotonic, sleep
 
 try:
     import truststore
@@ -25,6 +26,7 @@ G = 9.80665
 EARTH_RADIUS_M = 6_378_137.0
 EXCEL_MAX_ROWS = 1_048_576
 MAX_DATA_ROWS_PER_SHEET = EXCEL_MAX_ROWS - 1
+FR24_MIN_REQUEST_SPACING_S = 7.0  # stays below the Explorer tier's 10 requests/minute cap
 
 # Approximate geographic bounding boxes (south, north, west, east), in degrees.
 # Initial aircraft positions are sampled uniformly inside the selected rectangle.
@@ -40,17 +42,17 @@ REGIONS = {
 
 PRESETS = pd.DataFrame([
     {
-        "aircraft_type": "Multirotor-small",
-        "fr24_icao_types": "",
+        "aircraft_type": "Transportation",
+        "fr24_icao_types": "A320,A20N,A321,A21N,B772,B773,B77L,B77W",
         "count": 3,
-        "speed_min_mps": 5.0,
-        "speed_max_mps": 12.0,
-        "altitude_m": 100.0,
+        "speed_min_mps": 100.0,
+        "speed_max_mps": 230.0,
+        "altitude_m": 8000.0,
         "heading_deg": 45.0,
         "profile": "Waypoint-like",
-        "max_turn_rate_dps": 12.0,
+        "max_turn_rate_dps": 1.5,
         "pitch_deg": 2.0,
-        "pitch_amplitude_deg": 1.0,
+        "pitch_amplitude_deg": 0.5,
     },
     {
         "aircraft_type": "Multirotor-medium",
@@ -197,6 +199,7 @@ def generate_simultaneous_batch(
     sample_rate_hz: float,
     region_name: str,
     seed: int | None,
+    start_slot_interval_s: float,
 ):
     rng = np.random.default_rng(seed)
     shared_start_epoch_s = datetime.now(timezone.utc).timestamp()
@@ -204,6 +207,15 @@ def generate_simultaneous_batch(
     all_tracks = []
     summary_rows = []
     aircraft_number = 0
+    class_start_slots = {}
+    class_counts = {}
+    for row in aircraft_table.to_dict("records"):
+        aircraft_type = str(row["aircraft_type"]).strip()
+        class_counts[aircraft_type] = class_counts.get(aircraft_type, 0) + int(row["count"])
+    for aircraft_type, class_count in class_counts.items():
+        slots = np.arange(class_count, dtype=float) * start_slot_interval_s
+        rng.shuffle(slots)
+        class_start_slots[aircraft_type] = list(slots)
 
     for row in aircraft_table.to_dict("records"):
         aircraft_type = str(row["aircraft_type"]).strip()
@@ -211,6 +223,8 @@ def generate_simultaneous_batch(
         for _ in range(count):
             aircraft_number += 1
             aircraft_id = f"AC-{aircraft_number:04d}"
+            start_delay_s = float(class_start_slots[aircraft_type].pop())
+            aircraft_start_epoch_s = shared_start_epoch_s + start_delay_s
             speed = float(rng.uniform(row["speed_min_mps"], row["speed_max_mps"]))
             # Give every aircraft its own initial location within the selected region.
             start_lat = float(rng.uniform(south, north))
@@ -223,7 +237,7 @@ def generate_simultaneous_batch(
                 aircraft_type=aircraft_type,
                 duration_s=duration_s,
                 sample_rate_hz=sample_rate_hz,
-                start_epoch_s=shared_start_epoch_s,
+                start_epoch_s=aircraft_start_epoch_s,
                 start_lat_deg=start_lat,
                 start_lon_deg=start_lon,
                 altitude_m=float(row["altitude_m"]),
@@ -235,10 +249,15 @@ def generate_simultaneous_batch(
                 max_turn_rate_dps=float(row["max_turn_rate_dps"]),
                 rng=rng,
             )
+            track["aircraft_elapsed_s"] = track["simulation_time_s"]
+            track["start_delay_s"] = start_delay_s
+            track["simulation_time_s"] += start_delay_s
             all_tracks.append(track)
             summary_rows.append({
                 "aircraft_id": aircraft_id,
                 "aircraft_type": aircraft_type,
+                "start_delay_s": start_delay_s,
+                "aircraft_start_epoch_s": aircraft_start_epoch_s,
                 "initial_latitude_deg": start_lat,
                 "initial_longitude_deg": start_lon,
                 "initial_altitude_m": float(row["altitude_m"]),
@@ -252,17 +271,32 @@ def generate_simultaneous_batch(
             })
 
     combined = pd.concat(all_tracks, ignore_index=True) if all_tracks else pd.DataFrame()
+    if not combined.empty:
+        combined.sort_values(
+            ["time_tag_epoch_s", "aircraft_id"], kind="stable", inplace=True
+        )
+        combined.reset_index(drop=True, inplace=True)
     summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        summary.sort_values(
+            ["aircraft_start_epoch_s", "aircraft_id"], kind="stable", inplace=True
+        )
+        summary.reset_index(drop=True, inplace=True)
     return combined, summary
 
 
-def get_fr24_token() -> str | None:
-    """Read an FR24 token from Streamlit secrets or the process environment."""
+def get_fr24_token() -> tuple[str | None, str | None]:
+    """Read an FR24 token and report its source without exposing its value."""
     try:
         token = st.secrets.get("FR24_API_TOKEN")
     except Exception:
         token = None
-    return token or os.getenv("FR24_API_TOKEN")
+    if token:
+        return token, "Streamlit secrets"
+    token = os.getenv("FR24_API_TOKEN")
+    if token:
+        return token, "environment variable"
+    return None, None
 
 
 def fetch_fr24_historical_positions(
@@ -283,18 +317,68 @@ def fetch_fr24_historical_positions(
     }
     rows = []
     request_epochs = range(start_epoch_s, start_epoch_s + duration_s + 1, interval_s)
+    last_request_at = None
 
     for requested_epoch in request_epochs:
-        response = requests.get(
-            "https://fr24api.flightradar24.com/api/historic/flight-positions/full",
-            headers=headers,
-            params={"timestamp": requested_epoch, "bounds": bounds, "limit": 1000},
-            timeout=30,
-        )
+        for attempt in range(3):
+            if last_request_at is not None:
+                elapsed = monotonic() - last_request_at
+                sleep(max(0.0, FR24_MIN_REQUEST_SPACING_S - elapsed))
+            response = requests.get(
+                "https://fr24api.flightradar24.com/api/historic/flight-positions/full",
+                headers=headers,
+                # Explorer permits up to 20 results per request; this works across tiers.
+                params={"timestamp": requested_epoch, "bounds": bounds, "limit": 20},
+                timeout=30,
+            )
+            last_request_at = monotonic()
+            if response.status_code == 429:
+                if attempt >= 1:
+                    raise ValueError(
+                        "FR24 rate-limited the request twice (HTTP 429). Wait before trying again, "
+                        "or check the request-per-minute limit for your API plan."
+                    )
+                try:
+                    retry_after_s = float(response.headers.get("Retry-After", "60"))
+                except (TypeError, ValueError):
+                    retry_after_s = 60.0
+                sleep(max(retry_after_s, FR24_MIN_REQUEST_SPACING_S))
+                continue
+            if response.status_code in {500, 502, 503, 504}:
+                if attempt == 2:
+                    raise ValueError(
+                        f"FR24 remained unavailable after 3 attempts (HTTP {response.status_code}). "
+                        "Wait a few minutes and try again."
+                    )
+                try:
+                    retry_after_s = float(response.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    retry_after_s = 2.0 ** (attempt + 1)
+                sleep(max(retry_after_s, FR24_MIN_REQUEST_SPACING_S))
+                continue
+            break
         if response.status_code == 401:
-            raise ValueError("FR24 rejected the API token. Check the token and subscription.")
+            final_auth_header = response.request.headers.get("Authorization", "")
+            if final_auth_header.startswith("Bearer ") and len(final_auth_header) > len("Bearer "):
+                raise ValueError(
+                    "The app sent a Bearer Authorization header, but FR24 reports that no API key arrived. "
+                    "A redirect or network proxy may be stripping the header. Check the final request URL "
+                    "and proxy/network settings; the token value was not logged."
+                )
+            raise ValueError(
+                "The final HTTP request did not contain a Bearer Authorization header. "
+                "Restart the current app from this project folder and retry."
+            )
         if response.status_code == 403:
             raise ValueError("FR24 denied this endpoint. Check that the token has API access.")
+        if response.status_code == 400:
+            try:
+                error_payload = response.json()
+                detail = error_payload.get("details") or error_payload.get("message")
+            except (ValueError, AttributeError):
+                detail = None
+            suffix = f" FR24 says: {detail}" if detail else " Check the timestamp, bounds, and result limit."
+            raise ValueError(f"FR24 rejected the request (HTTP 400).{suffix}")
         response.raise_for_status()
         payload = response.json()
         records = payload if isinstance(payload, list) else (payload.get("data") or [])
@@ -416,15 +500,15 @@ def make_excel(combined: pd.DataFrame, summary: pd.DataFrame, aircraft_table: pd
 
 
 st.set_page_config(page_title="AeroGen", page_icon="🛩️", layout="wide")
-st.title("AeroGen- Synthetic Air Traffic Generator")
-st.caption("Generate synchronized trajectories for multiple UAV types, choose a geographical region, visualize all paths and export the combined dataset.")
+st.title("AeroGen - Aircraft Trajectory Generator")
+st.caption("Generate synthetic aircraft trajectories or fetch historical FR24 positions, visualize the tracks, and export the selected dataset.")
 
 st.subheader("1. Shared simulation settings")
 c1, c2, c3 = st.columns(3)
 with c1:
-    duration = st.number_input("Simulation duration (s)", 1.0, 3600.0, 120.0, 10.0)
+    duration = st.number_input("Simulation duration (s)", 1.0, 3600.0, 600.0, 10.0)
 with c2:
-    sample_rate = st.number_input("Sampling rate (Hz)", 0.1, 100.0, 10.0, 0.5)
+    sample_rate = st.number_input("Sampling rate (Hz)", 0.1, 100.0, 0.5, 0.5)
 with c3:
     seed_input = st.text_input("Random seed (blank = random)", "42")
 
@@ -435,6 +519,14 @@ with c5:
     st.metric("Samples per aircraft", f"{int(math.floor(duration * sample_rate)) + 1:,}")
 with c6:
     st.metric("Time tag format", "Unix Epoch (seconds)")
+start_slot_interval_s = st.number_input(
+    "Synthetic aircraft start-slot interval (s)",
+    min_value=1,
+    max_value=600,
+    value=30,
+    step=1,
+    help="Aircraft of the same type get distinct randomized start slots. Each keeps the selected flight duration.",
+)
 region_info = REGIONS[region_name]
 st.caption(
     f"Initial aircraft positions are randomized inside the approximate {region_name} region "
@@ -472,18 +564,36 @@ aircraft_table = st.data_editor(
 )
 
 st.subheader("3. Output")
-st.caption("Excel output includes a synchronized master dataset and separate sheets by aircraft type.")
-extract_fr24 = st.checkbox("Extract real flight data from FR24?", value=False)
+extract_fr24 = st.checkbox("Use historical FR24 data instead of synthetic data", value=False)
+st.caption(
+    "When unchecked, the app generates synthetic data. When checked, it fetches historical FR24 data only."
+)
+fr24_token, fr24_token_source = get_fr24_token() if extract_fr24 else (None, None)
 if extract_fr24:
+    if fr24_token:
+        st.success(
+            f"FR24 token detected in {fr24_token_source}; its value is hidden. "
+            "The app will add it to the Authorization: Bearer header when you extract."
+        )
+    else:
+        st.error(
+            "FR24 token not found in this Streamlit process. Check .streamlit/secrets.toml "
+            "or the FR24_API_TOKEN environment variable."
+        )
     st.caption(
         "Historical positions are queried within the selected region and time window. "
-        "Times below are UTC. Add FR24 ICAO type codes to each class above to match aircraft."
+        "Times below are UTC and are sent as Unix Epoch seconds. Add FR24 ICAO type codes "
+        "to each class above to match aircraft."
     )
     fr24_col1, fr24_col2, fr24_col3 = st.columns(3)
     with fr24_col1:
-        fr24_date = st.date_input("FR24 date (UTC)", value=date.today())
+        default_fr24_start = datetime.now(timezone.utc) - timedelta(seconds=duration)
+        fr24_date = st.date_input("FR24 date (UTC)", value=default_fr24_start.date())
     with fr24_col2:
-        fr24_time = st.time_input("FR24 start time (UTC)", value=time(12, 0))
+        fr24_time = st.time_input(
+            "FR24 start time (UTC)",
+            value=default_fr24_start.time().replace(second=0, microsecond=0),
+        )
     with fr24_col3:
         fr24_interval_s = st.number_input(
             "FR24 query interval (seconds)", min_value=10, max_value=3600,
@@ -491,22 +601,32 @@ if extract_fr24:
         )
     st.warning(
         "FR24 historical extraction makes one API request per interval and may consume API credits. "
-        "The selected duration and region are used for the request window and geographic filter."
+        "The app spaces requests to stay under the Explorer plan's 10 requests/minute limit; "
+        "longer extractions may take several minutes."
     )
-generate = st.button("Generate synchronized multi-aircraft batch", type="primary", use_container_width=True)
+generate = st.button(
+    "Fetch historical FR24 data" if extract_fr24 else "Generate synthetic trajectories",
+    type="primary",
+    use_container_width=True,
+)
 
 if generate:
-    required = [
+    synthetic_required = [
         "aircraft_type", "count", "speed_min_mps", "speed_max_mps", "altitude_m",
         "heading_deg", "profile", "max_turn_rate_dps", "pitch_deg", "pitch_amplitude_deg"
     ]
+    required = (
+        ["aircraft_type", "count", "fr24_icao_types"]
+        if extract_fr24
+        else synthetic_required
+    )
     if aircraft_table.empty or any(col not in aircraft_table.columns for col in required):
         st.error("Add at least one complete aircraft configuration row.")
         st.stop()
     if aircraft_table[required].isna().any().any():
         st.error("Complete all aircraft configuration fields before generating.")
         st.stop()
-    if (aircraft_table["speed_min_mps"] > aircraft_table["speed_max_mps"]).any():
+    if not extract_fr24 and (aircraft_table["speed_min_mps"] > aircraft_table["speed_max_mps"]).any():
         st.error("For every aircraft type, minimum speed must be less than or equal to maximum speed.")
         st.stop()
     if (aircraft_table["count"] < 1).any():
@@ -514,21 +634,20 @@ if generate:
         st.stop()
 
     total_aircraft = int(aircraft_table["count"].sum())
-    samples_per_aircraft = int(math.floor(duration * sample_rate)) + 1
-    total_rows = total_aircraft * samples_per_aircraft
     if total_aircraft > 1000:
         st.error("This first version supports up to 1,000 aircraft per simulation.")
         st.stop()
-    if total_rows > 2_000_000:
+    samples_per_aircraft = int(math.floor(duration * sample_rate)) + 1
+    total_rows = total_aircraft * samples_per_aircraft
+    if not extract_fr24 and total_rows > 2_000_000:
         st.error(
             f"This batch contains about {total_rows:,} rows. Reduce the duration, sampling rate, "
             "or number of aircraft for this Excel-first version."
         )
         st.stop()
 
-    seed = int(seed_input) if seed_input.strip() else None
+    seed = int(seed_input) if not extract_fr24 and seed_input.strip() else None
     class_type_codes = {}
-    fr24_token = None
     fr24_start_epoch = None
     if extract_fr24:
         for row in aircraft_table.to_dict("records"):
@@ -550,7 +669,6 @@ if generate:
         if fr24_date < date(2019, 11, 18) and fr24_interval_s < 60:
             st.error("FR24 historical positions before 2019-11-18 have minute resolution. Set the query interval to at least 60 seconds.")
             st.stop()
-        fr24_token = get_fr24_token()
         if not fr24_token:
             st.error(
                 "FR24 API token not found. Set FR24_API_TOKEN in Streamlit secrets or the environment."
@@ -559,10 +677,19 @@ if generate:
         fr24_start_epoch = int(
             datetime.combine(fr24_date, fr24_time, tzinfo=timezone.utc).timestamp()
         )
+        if fr24_start_epoch + int(round(duration)) > int(datetime.now(timezone.utc).timestamp()):
+            st.error("The selected FR24 time window ends in the future. Choose a start time far enough in the past for the selected duration.")
+            st.stop()
     settings = {
         "duration_s": duration,
         "sample_rate_hz": sample_rate,
         "samples_per_aircraft": samples_per_aircraft,
+        "synthetic_start_slot_interval_s": start_slot_interval_s,
+        "overall_batch_duration_s": duration + max(
+            max(0, int(aircraft_table.groupby("aircraft_type")["count"].sum().max()) - 1)
+            * start_slot_interval_s,
+            0,
+        ),
         "total_aircraft": total_aircraft,
         "total_samples": total_rows,
         "geographical_region": region_name,
@@ -573,12 +700,7 @@ if generate:
         "model_note": "Kinematic synthetic model; not validated aircraft performance or autopilot simulation",
     }
 
-    with st.spinner("Generating aircraft trajectories..."):
-        combined, summary = generate_simultaneous_batch(
-            aircraft_table, duration, sample_rate, region_name, seed
-        )
-        xlsx = make_excel(combined, summary, aircraft_table, settings)
-
+    combined = pd.DataFrame()
     fr24_tracks = pd.DataFrame()
     if extract_fr24:
         try:
@@ -615,20 +737,43 @@ if generate:
         except ValueError as exc:
             st.error(str(exc))
             st.stop()
+    else:
+        with st.spinner("Generating aircraft trajectories..."):
+            combined, summary = generate_simultaneous_batch(
+                aircraft_table, duration, sample_rate, region_name, seed,
+                start_slot_interval_s,
+            )
+            xlsx = make_excel(combined, summary, aircraft_table, settings)
 
-    batch_description = "Generated synthetic comparison batch" if extract_fr24 else "Generated"
-    st.success(
-        f"{batch_description}: {total_aircraft:,} aircraft across "
-        f"{len(aircraft_table):,} aircraft types, with {len(combined):,} synchronized samples."
-    )
     a, b, c = st.columns(3)
-    a.metric("Synthetic aircraft" if extract_fr24 else "Aircraft", f"{total_aircraft:,}")
-    b.metric("Aircraft types", f"{aircraft_table['aircraft_type'].nunique():,}")
-    c.metric("Synthetic data rows" if extract_fr24 else "Total data rows", f"{len(combined):,}")
+    if extract_fr24:
+        number_of_flights = (
+            fr24_tracks["aircraft_id"].nunique() if not fr24_tracks.empty else 0
+        )
+        st.success(
+            f"Fetched {number_of_flights:,} FR24 flights with "
+            f"{len(fr24_tracks):,} historical positions."
+        )
+        a.metric("FR24 flights", f"{number_of_flights:,}")
+        b.metric("Aircraft classes", f"{fr24_tracks['aircraft_type'].nunique() if not fr24_tracks.empty else 0:,}")
+        c.metric("FR24 positions", f"{len(fr24_tracks):,}")
+    else:
+        st.success(
+            f"Generated {total_aircraft:,} synthetic aircraft across "
+            f"{len(aircraft_table):,} aircraft types, with {len(combined):,} samples."
+        )
+        st.caption(
+            f"Aircraft of each type receive distinct randomized start slots, spaced "
+            f"{start_slot_interval_s:g} seconds apart; each keeps the full {duration:g}-second duration. "
+            "The master dataset and Excel sheets are ordered by timestamp."
+        )
+        a.metric("Aircraft", f"{total_aircraft:,}")
+        b.metric("Aircraft types", f"{aircraft_table['aircraft_type'].nunique():,}")
+        c.metric("Total data rows", f"{len(combined):,}")
     st.subheader("Airsky Picture")
     map_tracks = fr24_tracks if extract_fr24 else combined
     if extract_fr24:
-        st.caption("FR24 historical positions matched to your configured aircraft classes.")
+        st.caption("Historical FR24 positions matched to your configured aircraft classes.")
         if fr24_tracks.empty:
             st.warning("FR24 returned no positions matching the selected time, region, and aircraft type codes.")
         else:
@@ -698,23 +843,27 @@ if generate:
         st.info("No trajectories are available to plot for this selection.")
     else:
         st.plotly_chart(fig, use_container_width=True)
-    if extract_fr24 and not fr24_tracks.empty:
+    if extract_fr24:
+        st.subheader("FR24 dataset preview")
+        st.dataframe(fr24_tracks.head(30), use_container_width=True)
+        if not fr24_tracks.empty:
+            st.download_button(
+                "Download FR24 positions as CSV",
+                data=fr24_tracks.to_csv(index=False).encode("utf-8"),
+                file_name="fr24_historical_positions.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+    else:
+        st.subheader("Synthetic dataset preview")
+        st.dataframe(combined.head(30), use_container_width=True)
         st.download_button(
-            "Download FR24 positions as CSV",
-            data=fr24_tracks.to_csv(index=False).encode("utf-8"),
-            file_name="fr24_historical_positions.csv",
-            mime="text/csv",
+            "Download synthetic Excel workbook",
+            data=xlsx,
+            file_name="multi_aircraft_trajectory_batch.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-    st.subheader("Synthetic dataset preview" if extract_fr24 else "Combined dataset preview")
-    st.dataframe(combined.head(30), use_container_width=True)
-    st.download_button(
-        "Download multi-aircraft Excel workbook",
-        data=xlsx,
-        file_name="multi_aircraft_trajectory_batch.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
 else:
     st.info(
         "Configure multiple aircraft types above. All generated aircraft will share the same "
