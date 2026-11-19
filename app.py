@@ -55,30 +55,30 @@ PRESETS = pd.DataFrame([
         "pitch_amplitude_deg": 0.5,
     },
     {
-        "aircraft_type": "Multirotor-medium",
+        "aircraft_type": "Fighter",
         "fr24_icao_types": "",
         "count": 2,
-        "speed_min_mps": 8.0,
-        "speed_max_mps": 18.0,
+        "speed_min_mps": 170.0,
+        "speed_max_mps": 300.0,
         "altitude_m": 150.0,
         "heading_deg": 120.0,
         "profile": "S-turn",
-        "max_turn_rate_dps": 8.0,
-        "pitch_deg": 2.0,
-        "pitch_amplitude_deg": 1.5,
+        "max_turn_rate_dps": 16.0,
+        "pitch_deg": 5.0,
+        "pitch_amplitude_deg": 4.0,
     },
     {
-        "aircraft_type": "Fixed-wing-small",
-        "fr24_icao_types": "",
+        "aircraft_type": "UAV",
+        "fr24_icao_types": "HRM9",
         "count": 2,
-        "speed_min_mps": 15.0,
-        "speed_max_mps": 28.0,
-        "altitude_m": 250.0,
-        "heading_deg": 220.0,
+        "speed_min_mps": 30.0,
+        "speed_max_mps": 55.0,
+        "altitude_m": 6000.0,
+        "heading_deg": 120.0,
         "profile": "Constant turn",
-        "max_turn_rate_dps": 4.0,
-        "pitch_deg": 3.0,
-        "pitch_amplitude_deg": 1.0,
+        "max_turn_rate_dps": 3.0,
+        "pitch_deg": 2.0,
+        "pitch_amplitude_deg": 1.5,
     },
 ])
 
@@ -518,7 +518,7 @@ with c4:
 with c5:
     st.metric("Samples per aircraft", f"{int(math.floor(duration * sample_rate)) + 1:,}")
 with c6:
-    st.metric("Time tag format", "Unix Epoch (seconds)")
+    st.caption("Time tag format: Epoch time")
 start_slot_interval_s = st.number_input(
     "Synthetic aircraft start-slot interval (s)",
     min_value=1,
