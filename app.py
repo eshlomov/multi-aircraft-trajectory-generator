@@ -49,7 +49,7 @@ PRESETS = pd.DataFrame([
         "speed_max_mps": 230.0,
         "altitude_m": 8000.0,
         "heading_deg": 45.0,
-        "profile": "Waypoint-like",
+        "profile": "Straight",
         "max_turn_rate_dps": 1.5,
         "pitch_deg": 2.0,
         "pitch_amplitude_deg": 0.5,
