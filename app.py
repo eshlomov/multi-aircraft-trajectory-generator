@@ -3,6 +3,15 @@ import math
 import os
 from datetime import date, datetime, time, timezone
 
+try:
+    import truststore
+except ImportError:
+    truststore = None
+
+# Use the operating system's trusted CA store for HTTPS requests when installed.
+if truststore is not None:
+    truststore.inject_into_ssl()
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -323,6 +332,33 @@ def fetch_fr24_historical_positions(
     return pd.DataFrame(rows)
 
 
+def limit_fr24_aircraft_to_configured_counts(
+    tracks: pd.DataFrame, aircraft_table: pd.DataFrame
+) -> pd.DataFrame:
+    """Keep up to the configured number of best-sampled FR24 flights per class."""
+    if tracks.empty:
+        return tracks
+
+    counts_by_class = (
+        aircraft_table.groupby("aircraft_type")["count"].sum().astype(int).to_dict()
+    )
+    selected = []
+    for aircraft_class, class_tracks in tracks.groupby("aircraft_type", sort=False):
+        limit = counts_by_class.get(aircraft_class, 0)
+        if limit <= 0:
+            continue
+        samples_per_flight = class_tracks.groupby("aircraft_id").size()
+        selected_ids = (
+            samples_per_flight.rename("samples")
+            .reset_index()
+            .sort_values(["samples", "aircraft_id"], ascending=[False, True])
+            .head(limit)["aircraft_id"]
+        )
+        selected.append(class_tracks[class_tracks["aircraft_id"].isin(selected_ids)])
+
+    return pd.concat(selected, ignore_index=True) if selected else tracks.iloc[0:0].copy()
+
+
 def make_excel(combined: pd.DataFrame, summary: pd.DataFrame, aircraft_table: pd.DataFrame,
                settings: dict) -> bytes:
     wb = Workbook()
@@ -555,21 +591,40 @@ if generate:
                     class_type_codes,
                     fr24_token,
                 )
+                fr24_tracks = limit_fr24_aircraft_to_configured_counts(
+                    fr24_tracks, aircraft_table
+                )
         except requests.RequestException as exc:
-            st.error(f"FR24 request failed: {exc}")
+            if isinstance(exc, requests.exceptions.SSLError):
+                if truststore is None:
+                    st.error(
+                        "FR24 TLS certificate verification failed. Install the updated project "
+                        "dependencies in the same Python environment that runs Streamlit "
+                        "(`python -m pip install -r requirements.txt`) so it can use the "
+                        "system certificate store."
+                    )
+                else:
+                    st.error(
+                        "FR24 TLS certificate verification failed even with the system "
+                        "certificate store. If your network uses HTTPS inspection, install "
+                        "your organization’s trusted root CA or set REQUESTS_CA_BUNDLE to its PEM file."
+                    )
+            else:
+                st.error(f"FR24 request failed: {exc}")
             st.stop()
         except ValueError as exc:
             st.error(str(exc))
             st.stop()
 
+    batch_description = "Generated synthetic comparison batch" if extract_fr24 else "Generated"
     st.success(
-        f"Generated {total_aircraft:,} aircraft across {len(aircraft_table):,} aircraft types, "
-        f"with {len(combined):,} synchronized samples."
+        f"{batch_description}: {total_aircraft:,} aircraft across "
+        f"{len(aircraft_table):,} aircraft types, with {len(combined):,} synchronized samples."
     )
     a, b, c = st.columns(3)
-    a.metric("Aircraft", f"{total_aircraft:,}")
+    a.metric("Synthetic aircraft" if extract_fr24 else "Aircraft", f"{total_aircraft:,}")
     b.metric("Aircraft types", f"{aircraft_table['aircraft_type'].nunique():,}")
-    c.metric("Total data rows", f"{len(combined):,}")
+    c.metric("Synthetic data rows" if extract_fr24 else "Total data rows", f"{len(combined):,}")
     st.subheader("Airsky Picture")
     map_tracks = fr24_tracks if extract_fr24 else combined
     if extract_fr24:
@@ -577,7 +632,10 @@ if generate:
         if fr24_tracks.empty:
             st.warning("FR24 returned no positions matching the selected time, region, and aircraft type codes.")
         else:
-            st.success(f"Retrieved {len(fr24_tracks):,} FR24 positions for {fr24_tracks['aircraft_id'].nunique():,} flights.")
+            st.success(
+                f"Showing {fr24_tracks['aircraft_id'].nunique():,} FR24 flights "
+                f"({len(fr24_tracks):,} positions), limited by the configured count for each class."
+            )
     else:
         st.caption("Interactive geographic map. Each colored line represents one aircraft type.")
     fig = go.Figure()
@@ -593,7 +651,8 @@ if generate:
     shown_classes = set()
     # Downsample only the visualization; the Excel export retains every generated sample.
     max_points_per_track = 300
-    for aircraft_id, track in map_tracks.groupby("aircraft_id", sort=True):
+    track_groups = map_tracks.groupby("aircraft_id", sort=True) if not map_tracks.empty else []
+    for aircraft_id, track in track_groups:
         aircraft_type = track["aircraft_type"].iloc[0]
         color = class_colors[aircraft_type]
         step = max(1, int(math.ceil(len(track) / max_points_per_track)))
@@ -635,7 +694,10 @@ if generate:
         height=650,
         legend={"orientation": "h", "yanchor": "bottom", "y": -0.12},
     )
-    st.plotly_chart(fig, use_container_width=True)
+    if map_tracks.empty:
+        st.info("No trajectories are available to plot for this selection.")
+    else:
+        st.plotly_chart(fig, use_container_width=True)
     if extract_fr24 and not fr24_tracks.empty:
         st.download_button(
             "Download FR24 positions as CSV",
@@ -644,7 +706,7 @@ if generate:
             mime="text/csv",
             use_container_width=True,
         )
-    st.subheader("Combined dataset preview")
+    st.subheader("Synthetic dataset preview" if extract_fr24 else "Combined dataset preview")
     st.dataframe(combined.head(30), use_container_width=True)
     st.download_button(
         "Download multi-aircraft Excel workbook",
